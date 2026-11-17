@@ -1,0 +1,143 @@
+name: build-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            cpack: TGZ
+          - os: macos-latest
+            artifact: macos-arm64
+            cpack: TGZ
+          - os: windows-latest
+            artifact: windows-x86_64
+            cpack: ZIP
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Boost (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libboost-dev ninja-build
+
+      - name: Install Boost (macos)
+        if: runner.os == 'macOS'
+        run: brew install boost ninja
+
+      - name: Install Boost (windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install boost-asio:x64-windows
+        shell: cmd
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure (unix)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DTC_STATIC_CRT=ON
+          -DSERVIC_GIT_TAG=${{ vars.SERVIC_GIT_TAG || 'main' }}
+
+      - name: Configure (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DTC_STATIC_CRT=ON
+          -DSERVIC_GIT_TAG=${{ vars.SERVIC_GIT_TAG || 'main' }}
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Sanity check binaries
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then TCD=build/tcd.exe; else TCD=build/tcd; fi
+          "$TCD" --help
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "$TCD" --port 8699 --data "$RUNNER_TEMP/tc-data" --web web &
+            PID=$!
+            for i in $(seq 1 20); do
+              curl -fsS http://127.0.0.1:8699/api/health && break
+              sleep 0.5
+            done
+            curl -fsS http://127.0.0.1:8699/api/health
+            kill $PID
+          fi
+
+      - name: Package release archive
+        run: cmake --build build --target package --config ${{ env.BUILD_TYPE }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensorconsole-${{ matrix.artifact }}
+          path: |
+            build/tensorconsole-*.zip
+            build/tensorconsole-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archives
+        run: |
+          ls -la dist
+          test -n "$(ls dist)"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/tensorconsole-*.zip
+            dist/tensorconsole-*.tar.gz

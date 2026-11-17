@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TensorConsole — Train / Infer 可视化面板</title>
+<link rel="stylesheet" href="/vendor/uplot/uPlot.min.css">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230a0d12'/><path d='M7 20l5-8 4 6 3-4 6 6' stroke='%232dd4bf' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body>
+<aside id="sidebar">
+  <div class="brand"><b>Tensor<i>Console</i></b><small>v1.0</small></div>
+  <nav id="nav">
+    <a data-page="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>总览</a>
+    <a data-page="jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
+    <a data-page="new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>新建任务</a>
+    <a data-page="projects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>项目</a>
+    <a data-page="docker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15h16M6 15V9h4v6M12 15V5h4v10M3 18c1.5 1.5 4 2 6 2h6c3 0 5-2 6-5"/></svg>Docker / 部署</a>
+  </nav>
+  <div class="nav-sub" id="job-nav" hidden>
+    <div class="sub-title">当前任务</div>
+    <a data-page="job" data-tab="metrics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>指标曲线</a>
+    <a data-page="job" data-tab="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-5-6-5M12 19h8"/></svg>日志</a>
+    <a data-page="job" data-tab="grad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.2"/><circle cx="5" cy="18" r="2.2"/><circle cx="19" cy="12" r="2.2"/><path d="M7 6.8l9.4 4M7 17.2l9.4-4"/></svg>梯度 / 架构流</a>
+    <a data-page="job" data-tab="prof"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg>耗时分析</a>
+    <a data-page="job" data-tab="report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 13h6M9 17h6"/></svg>报表 / 产物</a>
+  </div>
+  <div class="side-foot">TensorConsole 1.0.0<br>servic.cpp · TensorN</div>
+</aside>
+
+<div id="main">
+  <header id="topbar">
+    <div id="crumb">总览</div>
+    <div class="top-actions">
+      <span class="pill" id="conn"><span class="dot"></span><span id="conn-text">连接中</span></span>
+      <button class="btn sm ghost" id="token-btn" title="设置访问令牌">令牌</button>
+    </div>
+  </header>
+
+  <main id="content">
+    <!-- overview -->
+    <section class="page" id="page-overview">
+      <div class="grid c2">
+        <div class="card stat-card">
+          <div class="card-h">主机<span class="sub" id="ov-host-sub"></span></div>
+          <div class="card-b stats" id="ov-host"></div>
+        </div>
+        <div class="card">
+          <div class="card-h">主机趋势<span class="sub">CPU / 内存 %</span></div>
+          <div class="chart-box" id="ch-host"></div>
+        </div>
+      </div>
+      <div class="grid c2">
+        <div class="card stat-card">
+          <div class="card-h">GPU 集群<span class="sub" id="ov-cluster-sub"></span></div>
+          <div class="card-b stats" id="ov-cluster"></div>
+        </div>
+        <div class="card">
+          <div class="card-h">集群趋势<span class="sub">利用率 / 显存 %</span></div>
+          <div class="chart-box" id="ch-cluster"></div>
+        </div>
+      </div>
+      <div class="sec-h">单卡明细<span class="sub" id="ov-gpus-sub"></span></div>
+      <div class="grid" id="ov-gpus"></div>
+      <div class="grid c2">
+        <div class="card"><div class="card-h">各卡利用率<span class="sub">%</span></div><div class="chart-box" id="ch-util"></div></div>
+        <div class="card"><div class="card-h">各卡显存<span class="sub">MiB</span></div><div class="chart-box" id="ch-mem"></div></div>
+      </div>
+      <div class="grid side">
+        <div class="card">
+          <div class="card-h">最近任务<span class="sub" id="ov-jobs-sub"></span><span class="right"><button class="btn sm ghost" id="ov-jobs-all">查看全部</button></span></div>
+          <div class="tbl-wrap" id="ov-jobs"></div>
+        </div>
+        <div class="card">
+          <div class="card-h">实时事件<span class="sub" id="ev-count"></span></div>
+          <div class="feed" id="ev-feed"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- jobs -->
+    <section class="page" id="page-jobs" hidden>
+      <div class="toolbar">
+        <select class="input" id="f-status"><option value="">全部状态</option><option>running</option><option>succeeded</option><option>failed</option><option>stopped</option><option>queued</option></select>
+        <select class="input" id="f-type"><option value="">全部类型</option><option>train</option><option>eval</option><option>generate</option><option>test</option><option>build</option><option>docker</option><option>deploy</option><option>custom</option></select>
+        <select class="input" id="f-project"><option value="">全部项目</option></select>
+        <input class="input" id="f-search" placeholder="搜索标题 / ID…" style="width:200px">
+        <span class="spacer"></span>
+        <span class="lbl" id="jobs-count"></span>
+        <button class="btn sm" id="jobs-refresh">刷新</button>
+        <button class="btn sm primary" id="jobs-new">新建任务</button>
+      </div>
+      <div class="card"><div class="tbl-wrap" style="max-height:calc(100vh - 220px)" id="jobs-table"></div></div>
+    </section>
+
+    <!-- new job -->
+    <section class="page" id="page-new" hidden>
+      <div class="card"><div class="card-b toolbar">
+        <span class="lbl">项目</span>
+        <select class="input" id="new-project" style="min-width:220px"></select>
+        <span class="lbl">类型</span>
+        <div class="seg" id="new-type"></div>
+      </div></div>
+      <div id="new-form" style="display:flex;flex-direction:column;gap:12px"></div>
+      <div class="toolbar">
+        <input class="input" id="new-title" placeholder="任务标题（可选）" style="width:280px">
+        <span class="spacer"></span>
+        <button class="btn primary" id="new-submit">提交任务</button>
+      </div>
+    </section>
+
+    <!-- projects -->
+    <section class="page" id="page-projects" hidden>
+      <div class="toolbar">
+        <span class="lbl" id="proj-count"></span>
+        <span class="spacer"></span>
+        <button class="btn sm" id="proj-refresh">刷新</button>
+        <button class="btn sm primary" id="proj-new">注册项目</button>
+      </div>
+      <div class="card"><div class="tbl-wrap" id="proj-table"></div></div>
+    </section>
+
+    <!-- docker -->
+    <section class="page" id="page-docker" hidden>
+      <div class="toolbar">
+        <span class="pill" id="docker-avail"><span class="dot"></span>docker</span>
+        <label class="switch"><input type="checkbox" id="docker-auto"><i></i><span class="lbl">自动刷新 10s</span></label>
+        <span class="spacer"></span>
+        <button class="btn sm" id="docker-refresh">刷新</button>
+      </div>
+      <div class="card">
+        <div class="card-h">容器<span class="sub">docker ps -a</span></div>
+        <div class="tbl-wrap" id="dk-containers"></div>
+      </div>
+      <div class="card">
+        <div class="card-h">镜像<span class="sub">docker images</span></div>
+        <div class="tbl-wrap" id="dk-images"></div>
+      </div>
+      <div class="card">
+        <div class="card-h">部署任务<span class="sub">systemd / docker / script</span></div>
+        <div class="card-b" id="deploy-form"></div>
+        <div class="card-b" style="border-top:1px solid var(--line-soft);display:flex;justify-content:flex-end">
+          <button class="btn primary" id="deploy-submit">提交部署</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- job detail -->
+    <section class="page" id="page-job" hidden>
+      <div class="card"><div class="card-b job-head" id="job-header"></div></div>
+      <div class="card">
+        <div class="tabs" id="job-tabs">
+          <a data-tab="metrics">指标</a><a data-tab="logs">日志</a><a data-tab="grad">梯度 / 架构流</a><a data-tab="prof">耗时分析</a><a data-tab="report">报表 / 产物</a>
+        </div>
+        <div class="tabpane" id="pane-metrics"><div class="card-b grid c2" id="metrics-charts"></div></div>
+        <div class="tabpane" id="pane-logs" hidden>
+          <div class="toolbar" style="padding:10px 14px;border-bottom:1px solid var(--line-soft)">
+            <label class="switch"><input type="checkbox" id="logs-follow" checked><i></i><span class="lbl">实时跟随</span></label>
+            <span class="lbl" id="logs-count"></span>
+            <span class="spacer"></span>
+            <button class="btn sm" id="logs-reload">重载</button>
+            <button class="btn sm" id="logs-bottom">回到底部</button>
+          </div>
+          <pre class="logs" id="logs-view" style="max-height:calc(100vh - 320px)"></pre>
+        </div>
+        <div class="tabpane" id="pane-grad" hidden>
+          <div class="toolbar grad-top">
+            <div class="seg" id="grad-views">
+              <button data-view="arch" class="active">架构数据流</button>
+              <button data-view="moe">MoE 路由</button>
+              <button data-view="heat">权重热力图</button>
+            </div>
+            <span class="lbl">rank</span><select class="input" id="grad-rank"></select>
+            <span class="lbl">刻度</span><select class="input" id="grad-scale"><option value="log">log10</option><option value="lin">线性</option></select>
+            <span class="pill mono" id="grad-modelinfo">S=— · E=—</span>
+            <span class="spacer"></span>
+            <div class="grad-legend" id="grad-legend"></div>
+          </div>
+          <div class="toolbar grad-transport">
+            <button class="btn sm" id="grad-prev">◀</button>
+            <button class="btn sm" id="grad-play">▶ 回放</button>
+            <button class="btn sm" id="grad-next">▶</button>
+            <input type="range" id="grad-step" min="0" max="0" value="0" style="flex:1;accent-color:var(--accent)">
+            <span class="mono" id="grad-step-label" style="min-width:110px"></span>
+            <button class="btn sm" id="grad-reload">重载</button>
+          </div>
+
+          <div class="grad-sub" id="grad-sub-arch">
+            <div class="arch-layout">
+              <aside class="arch-rail">
+                <div class="rail-h">渲染控制</div>
+                <label class="fld"><span>节点着色</span><select class="input" id="arch-metric">
+                  <option value="l2">梯度 L2</option><option value="share">步内能量占比</option>
+                  <option value="load">MoE 负载代理</option><option value="active">激活 / 零梯度率</option>
+                  <option value="zero">零梯度占比</option></select></label>
+                <label class="fld"><span>专家格编码</span><select class="input" id="arch-cell">
+                  <option value="load">负载占比</option><option value="active">路由激活</option><option value="grad">梯度 L2</option></select></label>
+                <label class="fld"><span>流向粒子</span><select class="input" id="arch-flow">
+                  <option value="both">前向 + 反向</option><option value="fwd">仅前向数据</option>
+                  <option value="bwd">仅反向梯度</option><option value="off">关闭</option></select></label>
+                <label class="fld"><span>流速 <b class="rv" id="arch-speed-label">1.0×</b></span><input type="range" id="arch-speed" min="20" max="300" value="100"></label>
+                <label class="fld"><span>负载代理指数 <b class="rv" id="arch-pow-label">g^2.00</b></span><input type="range" id="arch-pow" min="50" max="300" step="25" value="200"></label>
+                <label class="fld"><span>饥饿阈值 <b class="rv" id="arch-hungry-label">4%</b></span><input type="range" id="arch-hungry" min="0" max="20" value="4"></label>
+                <label class="fld"><span>层聚焦</span><select class="input" id="arch-focus"><option value="all">全部层</option></select></label>
+                <label class="fld"><span>缩放 <b class="rv" id="arch-zoom-label">80%</b></span><input type="range" id="arch-zoom" min="12" max="240" value="80"></label>
+                <div class="rail-switches">
+                  <label class="switch"><input type="checkbox" id="arch-experts" checked><i></i><span class="lbl">专家格</span></label>
+                  <label class="switch"><input type="checkbox" id="arch-labels" checked><i></i><span class="lbl">数值标签</span></label>
+                  <label class="switch"><input type="checkbox" id="arch-bus" checked><i></i><span class="lbl">混合总线</span></label>
+                </div>
+                <div class="rail-btns">
+                  <button class="btn sm" id="arch-fit">适配宽度</button>
+                  <button class="btn sm" id="arch-fitall">全图</button>
+                  <button class="btn sm ghost" id="arch-reset">重置</button>
+                  <button class="btn sm" id="arch-png">导出 PNG</button>
+                  <button class="btn sm" id="arch-json">导出 JSON</button>
+                </div>
+                <div class="rail-note">拖拽平移 · 滚轮缩放 · 点击节点 / 专家格查看详情 · 右上小地图跳转</div>
+              </aside>
+              <div class="arch-stage">
+                <div class="arch-stage-h">
+                  <b>MetaModel 前向数据流</b>
+                  <span class="flowkey"><i class="fwd"></i>前向数据</span>
+                  <span class="flowkey"><i class="bwd"></i>反向梯度</span>
+                  <span class="spacer"></span>
+                  <span class="dim">emb → RT → 组路由 → Flash-Attn → MoE → Sinkhorn 混合 → tied head</span>
+                </div>
+                <div class="arch-body">
+                  <div id="arch-wrap">
+                    <canvas id="arch-canvas"></canvas>
+                    <div class="empty" id="arch-empty" hidden><b>无梯度数据</b>提交训练时开启「梯度示波器」或等待首个 step</div>
+                  </div>
+                  <canvas id="arch-mini" title="小地图：点击 / 拖拽跳转"></canvas>
+                </div>
+              </div>
+              <aside class="arch-inspect">
+                <div class="card"><div class="card-h">节点详情</div><div class="card-b" id="arch-detail"></div></div>
+                <div class="card"><div class="card-h">当前 step 概览</div><div class="card-b" id="arch-step"></div></div>
+              </aside>
+            </div>
+          </div>
+
+          <div class="grad-sub" id="grad-sub-moe" hidden>
+            <div class="toolbar moe-filters">
+              <span class="lbl">矩阵指标</span><select class="input" id="moe-metric">
+                <option value="load">负载代理占比</option><option value="active">路由激活</option><option value="grad">专家梯度 L2</option></select>
+              <span class="lbl">窗口</span><select class="input" id="moe-window">
+                <option value="step">当前 step</option><option value="mean">窗口均值</option><option value="freq">激活频率</option></select>
+              <span class="spacer"></span>
+              <span class="dim">负载 = 专家梯度能量 g^p 归一占比（代理）；零梯度 = 该 step 未路由</span>
+              <button class="btn sm" id="moe-csv">导出 CSV</button>
+            </div>
+            <div class="empty" id="moe-empty" hidden><b>无 MoE 数据</b>需要含 moe.experts 权重的梯度采集</div>
+            <div id="moe-body">
+              <div class="moe-layout">
+                <div class="card">
+                  <div class="card-h">层 × 专家路由矩阵<span class="sub" id="moe-matrix-sub"></span></div>
+                  <div id="moe-matrix-wrap"><canvas id="moe-matrix"></canvas></div>
+                </div>
+                <div class="card">
+                  <div class="card-h">均衡度趋势<span class="sub">逐 step · 跨层均值</span></div>
+                  <div class="chart-box" id="moe-trend"></div>
+                </div>
+              </div>
+              <div class="grid c2">
+                <div class="card"><div class="card-h">专家覆盖<span class="sub">跨层聚合 · 点击行高亮列</span></div><div class="tbl-wrap" id="moe-experts"></div></div>
+                <div class="card"><div class="card-h">逐层均衡<span class="sub">点击行跳转架构图</span></div><div class="tbl-wrap" id="moe-layers"></div></div>
+              </div>
+              <div class="card" id="moe-detail-card" hidden><div class="card-h">专家详情</div><div class="card-b" id="moe-detail"></div></div>
+            </div>
+          </div>
+
+          <div class="grad-sub" id="grad-sub-heat" hidden>
+            <div class="toolbar heat-filters">
+              <span class="lbl">模块</span><select class="input" id="grad-module"></select>
+              <input class="input" id="grad-search" placeholder="过滤权重名 / 别名…" style="width:190px">
+              <span class="lbl">标签</span><select class="input" id="grad-labels"><option value="compact">紧凑别名</option><option value="full">完整参数名</option></select>
+              <span class="spacer"></span>
+              <span class="dim">行按层分组 · 组头显示该层步内梯度能量占比</span>
+            </div>
+            <div id="grad-layout">
+              <div class="card" style="background:#0b0f14">
+                <div id="grad-axis-wrap"><canvas id="grad-axis"></canvas></div>
+                <div id="grad-scroll"><canvas id="grad-heatmap"></canvas></div>
+                <div id="grad-wave-wrap"><canvas id="grad-wave"></canvas></div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:12px">
+                <div class="card"><div class="card-h">选中权重</div><div class="card-b" id="grad-detail"></div></div>
+                <div class="card"><div class="card-h">当前 step 概览</div><div class="card-b" id="grad-stepinfo"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="tabpane" id="pane-prof" hidden>
+          <div class="toolbar" style="padding:10px 14px;border-bottom:1px solid var(--line-soft)">
+            <span class="pill" id="prof-source"></span>
+            <span class="lbl" id="prof-total"></span>
+            <span class="spacer"></span>
+            <button class="btn sm" id="flame-reset">重置缩放</button>
+            <button class="btn sm" id="prof-upload-btn">上传 Chrome Trace</button>
+            <input type="file" id="prof-upload" accept=".json,application/json" hidden>
+            <button class="btn sm" id="prof-reload">重载</button>
+          </div>
+          <div id="flame-wrap"><canvas id="flame-canvas"></canvas></div>
+          <div class="tbl-wrap" style="max-height:420px"><table class="tbl" id="prof-table"></table></div>
+        </div>
+        <div class="tabpane" id="pane-report" hidden>
+          <div class="toolbar" style="padding:10px 14px;border-bottom:1px solid var(--line-soft)">
+            <span class="spacer"></span>
+            <button class="btn sm" id="report-md-dl">下载 .md</button>
+            <button class="btn sm" id="report-json-dl">下载 .json</button>
+            <button class="btn sm" id="report-reload">重载</button>
+          </div>
+          <div class="report-md" id="report-view"></div>
+          <div class="card-h" style="border-top:1px solid var(--line-soft)">产物文件</div>
+          <div class="artifacts" id="artifacts-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts"></div>
+<div id="modal-root"></div>
+
+<script src="/vendor/uplot/uPlot.iife.min.js"></script>
+<script src="/js/api.js"></script>
+<script src="/js/ui.js"></script>
+<script src="/js/charts.js"></script>
+<script src="/js/oscilloscope.js"></script>
+<script src="/js/arch.js"></script>
+<script src="/js/moe.js"></script>
+<script src="/js/flame.js"></script>
+<script src="/js/form.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
