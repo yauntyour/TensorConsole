@@ -25,6 +25,8 @@ namespace tc
     // ------------------------------------------------------------- strings
     std::string trim(const std::string &s);
     std::vector<std::string> split(const std::string &s, char d);
+    // Whitespace tokenizer that honours "..." / '...' groups (quotes stripped).
+    std::vector<std::string> split_quoted(const std::string &s);
     bool starts_with(const std::string &s, const std::string &p);
     bool ends_with(const std::string &s, const std::string &p);
     std::string to_lower(std::string s);

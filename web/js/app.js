@@ -412,6 +412,7 @@ const App = {
     const nameI = UI.el('input', { class: 'input', value: p?.name || '', placeholder: '显示名称' });
     const kindS = UI.el('select', { class: 'input' },
       UI.el('option', { value: 'metamodel' }, 'metamodel（TensorN MetaModel）'),
+      UI.el('option', { value: 'pytorch' }, 'pytorch（PyTorch 训练项目）'),
       UI.el('option', { value: 'generic' }, 'generic（通用 CMake 项目）'));
     kindS.value = p?.kind || 'metamodel';
     const rootI = UI.el('input', { class: 'input', value: p?.root || '', placeholder: 'D:/path/to/project' });
@@ -421,7 +422,7 @@ const App = {
         UI.el('label', { class: 'fld' }, UI.el('span', {}, '项目 ID'), idI),
         UI.el('label', { class: 'fld' }, UI.el('span', {}, '名称'), nameI),
         UI.el('label', { class: 'fld' }, UI.el('span', {}, '类型'), kindS),
-        UI.el('label', { class: 'fld' }, UI.el('span', {}, '根目录', UI.el('span', { class: 'help', title: '包含 build/ 与 datasets/ 的项目根' }, '?')), rootI),
+        UI.el('label', { class: 'fld' }, UI.el('span', {}, '根目录', UI.el('span', { class: 'help', title: 'metamodel：包含 build/ 与 datasets/ 的项目根；pytorch：含训练脚本的仓库根' }, '?')), rootI),
       ],
       actions: [
         { label: '取消', kind: 'ghost', onClick: c => c() },
@@ -629,12 +630,15 @@ const App = {
     }
     const ranks = [...new Set(rows.map(r => r.rank ?? 0))].sort((a, b) => a - b);
     const steps = [...new Set(rows.map(r => r.step))].sort((a, b) => a - b);
-    const known = new Set(['ce', 'aux', 'grad_norm', 'lr', 'tps', 'sec', 'pool_used', 'pool_reserved', 'pool_peak', 'pool_trim', 'driver_free', 'fm', 'nodes', 'step', 'trainable', 'params_total', 'unfrozen']);
+    const known = new Set(['ce', 'aux', 'grad_norm', 'lr', 'tps', 'sec', 'pool_used', 'pool_reserved', 'pool_peak', 'pool_trim', 'driver_free', 'fm', 'nodes', 'step', 'trainable', 'params_total', 'unfrozen', 'lrc_lambda', 'drift', 'grate', 'emb_rms']);
     const extra = [...new Set(rows.flatMap(r => Object.keys(r.v || {})))].filter(k => !known.has(k));
     const groups = [
       ['损失 CE / aux', ['ce', 'aux']],
       ['梯度范数 |g|', ['grad_norm']],
       ['学习率 lr', ['lr']],
+      ['LR 控制 λ', ['lrc_lambda']],
+      ['漂移 drift / 梯度增长 grate', ['drift', 'grate']],
+      ['tied emb RMS', ['emb_rms']],
       ['吞吐 tok/s', ['tps']],
       ['step 耗时 s', ['sec']],
       ['显存池 MiB', ['pool_used', 'pool_reserved', 'pool_peak']],
@@ -691,6 +695,20 @@ const App = {
       ]);
       this.gradOrder = order;
       Osc.setData(order, rows);
+      // 架构流 / MoE 视图依赖 MetaModel 命名；通用模型（PyTorch）默认热力图。
+      if (order.length) {
+        const meta = order.some(o => o.name === 'emb.weight' || o.name === 'head_norm.weight' ||
+          o.name.startsWith('decoder_layers.'));
+        document.querySelectorAll('#grad-views button').forEach(b => {
+          if (b.dataset.view === 'heat') return;
+          b.disabled = !meta;
+          b.title = meta ? '' : 'MetaModel 专属视图，通用模型请用权重热力图';
+        });
+        if (!meta) {
+          document.getElementById('grad-modelinfo').textContent = `generic · ${order.length} 权重`;
+          if (Osc.subview !== 'heat') Osc.setSubview('heat');
+        }
+      }
       document.getElementById('grad-step-label').textContent =
         Osc.steps.length ? `step ${Osc.steps[Osc.step]} (${Osc.step + 1}/${Osc.steps.length})` : '无数据';
     } catch (e) { UI.err(e); }

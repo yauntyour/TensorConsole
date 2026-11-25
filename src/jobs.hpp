@@ -55,6 +55,8 @@ namespace tc
             std::atomic<bool> stop_req{false};
             std::atomic<bool> done{false};
             int64_t stop_deadline = 0;
+            std::streamoff met_off = 0;
+            std::string met_part;
             J order;
             bool order_set = false;
             int64_t last_stdout_step = -1;
@@ -71,9 +73,11 @@ namespace tc
         void on_line(Live *L, int rank, const std::string &line);
         void tail_csv(Live *L, size_t r);
         void tail_grad(Live *L, size_t r);
+        void tail_metrics(Live *L);
         void flush_grad(Live *L, size_t r, int64_t step);
         void ensure_order(Live *L, const std::vector<std::string> &names);
         void finalize(Live *L, const std::string &status, int exit_code);
+        void ensure_train_slot(const std::string &project_id, const J &params);
         ProcSpec build_spec(const J &proj, const J &params, std::vector<ProcSpec> &phases);
         std::vector<ProcSpec> docker_phases(const J &proj, const J &params);
         std::vector<ProcSpec> deploy_phases(const J &proj, const J &params);

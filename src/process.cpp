@@ -182,16 +182,37 @@ namespace tc
         }
         env_block.push_back(L'\0');
 
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = wr;
-        si.hStdError = wr;
-        si.hStdInput = nullptr;
+        // Restrict inheritance to the stdout pipe: a duplicated server socket
+        // would keep HTTP/SSE connections open long after tcd replied.
+        STARTUPINFOEXW si{};
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdOutput = wr;
+        si.StartupInfo.hStdError = wr;
+        si.StartupInfo.hStdInput = nullptr;
+        bool listed = false, extended = false;
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<char> attr_buf(attr_size > 0 ? attr_size : 1);
+        si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+        HANDLE inherit[] = {wr};
+        if (attr_size > 0 &&
+            InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size))
+        {
+            listed = true;
+            extended = UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                                                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                 inherit, sizeof(inherit), nullptr, nullptr);
+        }
+        si.StartupInfo.cb = extended ? sizeof(STARTUPINFOEXW) : sizeof(STARTUPINFO);
         PROCESS_INFORMATION pi{};
-        BOOL ok = CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
-                                 CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                                 env_block.data(), wcwd.empty() ? nullptr : wcwd.c_str(), &si, &pi);
+        DWORD flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        if (extended)
+            flags |= EXTENDED_STARTUPINFO_PRESENT;
+        BOOL ok = CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, flags,
+                                 env_block.data(), wcwd.empty() ? nullptr : wcwd.c_str(),
+                                 &si.StartupInfo, &pi);
+        if (listed)
+            DeleteProcThreadAttributeList(si.lpAttributeList);
         CloseHandle(wr);
         if (!ok)
         {

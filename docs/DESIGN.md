@@ -96,7 +96,7 @@ TensorConsole/
 │   ├── monitor.hpp/.cpp         GPU/CPU/内存采样
 │   ├── api.cpp                  全部 REST/SSE 路由 + 静态文件
 │   └── main.cpp                 入口（端口/数据目录/token 配置）
-├── sdk/tc_probe.hpp             header-only 引擎探针（梯度+耗时，可选深度集成）
+├── sdk/tc_probe.hpp / .py       引擎探针（C++ header-only / PyTorch；梯度+耗时）
 ├── cli/tc.cpp                   tc CLI（Agent 接口）
 ├── web/                         前端（index.html + css + js + vendor/uplot）
 ├── data/                        运行时数据（gitignore）
@@ -292,7 +292,7 @@ emb.weight                            ← 最靠近输入（tied 输出头另计
 | 级别 | 通道 | 侵入性 | 数据 |
 |---|---|---|---|
 | L0 | `ENG_DUMP_GRAD=<path>` CSV tail | 零（MetaModel 现成） | 每步每参数 `step,name,grad_l2` |
-| L1 | `sdk/tc_probe.hpp` JSONL/UDP | 引擎加 3 行代码 | 同上 + 精确拓扑 order + rank + 可选 grad 统计(max/mean/zero 比例) |
+| L1 | `sdk/tc_probe.hpp`（C++）/ `sdk/tc_probe.py`（PyTorch） | 引擎/脚本加 3 行代码 | 同上 + 精确拓扑 order + rank + 可选 grad 统计(max/mean/zero 比例) |
 | L2 | 引擎自定义 POST `/jobs/:id/grad` | 任意 | 任意来源（Python 桥接等） |
 
 L0 流程：JobManager 启动 train 时注入 `ENG_DUMP_GRAD=data/jobs/<id>/grad_raw.csv`；
@@ -435,6 +435,26 @@ build 组：target[], cuda_arch, clean, build_type, extra_cmake_args, use_projec
 docker 组：dockerfile, context, tag, build_args{}, gpus, mounts[], env{}, network, shm_size, ipc, restart, command, detach。
 deploy 组：mode, unit_name, script_path, env{}, health_check。
 generic 项目：custom command + argv + cwd + env + watch 规则（CSV 路径/列映射、stdout 正则）。
+
+### 8.6 PyTorch 项目（kind=pytorch）
+
+PyTorch 训练接入沿用「受管子进程 + 文件探针」模型，不引入 Python 运行时依赖：
+
+- **提交**：`train` job 按项目 kind 分派。pytorch 参数：`python`、`script`、`args`
+  （引号感知切分）、`cwd`、`env`、`out`（STOP 文件前缀）、`gpus`、
+  `launcher=python|ddp`、`master_port`。`ddp` 由 tcd 直接按 gpus 每卡拉起一个
+  worker（注入 `RANK/WORLD_SIZE/LOCAL_RANK/MASTER_ADDR/MASTER_PORT`，
+  与 torchrun 的子进程契约一致，但不依赖 torchrun 的 rendezvous）。
+- **注入**：`TC_JOB_ID/TC_JOB_DIR/TC_RANK/TC_SERVER/TC_TOKEN/TC_STOP_FILE`、
+  `CUDA_VISIBLE_DEVICES`、`PYTHONPATH=<sdk>`、`PYTHONUNBUFFERED=1`。
+- **采集**：`sdk/tc_probe.py` 写 `metrics.jsonl`（src=probe，单次 os.write 保证多 rank
+  追加原子性）/`grad_raw_r<rank>.csv`/`grad_order.json`/`trace.json`，与 C++ SDK 同构；
+  ddp 的其他 rank 写 `trace_r<rank>.json`，finalize 时合并解析。Watcher 增加
+  metrics.jsonl tail（仅转发非内部 src 的行，避免与 stdout/CSV 重复推送）。
+- **梯度顺序**：优先 SDK 声明的 `grad_order.json`（默认 reversed named_parameters，
+  output→input），其次 MetaModel 模板，最后按首见顺序。
+- **rank**：worker 的 rank 取自 `LOCAL_RANK`；grad tail 按 worker 数量展开，
+  每个 worker 独立 `grad_raw_r<rank>.csv`，停止文件按 rank 前缀分别写入。
 
 ---
 

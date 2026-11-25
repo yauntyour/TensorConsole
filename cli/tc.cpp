@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -88,20 +89,79 @@ namespace
         std::string raw;
         char buf[16384];
         boost::system::error_code ec;
-        for (;;)
-        {
+        auto pump = [&] {
             size_t n = sock.read_some(asio::buffer(buf), ec);
             if (n)
                 raw.append(buf, n);
+        };
+        size_t hb;
+        while ((hb = raw.find("\r\n\r\n")) == std::string::npos)
+        {
+            pump();
             if (ec)
                 break;
         }
         Resp r;
+        if (hb == std::string::npos)
+            return r;
         auto sp = raw.find(' ');
         if (sp != std::string::npos)
             r.status = std::atoi(raw.c_str() + sp + 1);
-        auto hb = raw.find("\r\n\r\n");
-        r.body = hb == std::string::npos ? "" : raw.substr(hb + 4);
+        std::string lower = raw.substr(0, hb);
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        auto header = [&](const char *name) -> long long {
+            auto p = lower.find(std::string("\r\n") + name + ":");
+            if (p == std::string::npos)
+                return -1;
+            return std::atoll(lower.c_str() + p + 2 + std::strlen(name) + 1);
+        };
+        long long clen = header("content-length");
+        bool chunked = lower.find("\r\ntransfer-encoding:") != std::string::npos &&
+                       lower.find("chunked") != std::string::npos;
+        const size_t body_start = hb + 4;
+        if (clen >= 0)
+        {
+            // Don't wait for EOF: spawned job processes may hold a duplicate
+            // of the connection handle, so the socket can outlive the response.
+            while ((long long)(raw.size() - body_start) < clen && !ec)
+                pump();
+            r.body = raw.substr(body_start, (size_t)clen);
+        }
+        else if (chunked)
+        {
+            for (;;)
+            {
+                size_t pos = body_start, out = raw.find("\r\n0\r\n\r\n", body_start);
+                bool done = out != std::string::npos;
+                if (done)
+                {
+                    std::string dec;
+                    while (pos < out)
+                    {
+                        auto eol = raw.find("\r\n", pos);
+                        if (eol == std::string::npos || eol > out)
+                            break;
+                        long long n = std::strtoll(raw.c_str() + pos, nullptr, 16);
+                        pos = eol + 2;
+                        dec.append(raw.substr(pos, (size_t)n));
+                        pos += (size_t)n + 2;
+                    }
+                    r.body = dec;
+                    break;
+                }
+                size_t before = raw.size();
+                pump();
+                if (ec || raw.size() == before)
+                    break;
+            }
+        }
+        else
+        {
+            while (!ec)
+                pump();
+            r.body = raw.substr(body_start);
+        }
         return r;
     }
 
@@ -387,11 +447,13 @@ namespace
         std::printf(
             "tc — TensorConsole CLI (server: --server URL, auth: --token T, env TC_SERVER/TC_TOKEN)\n"
             "  health | system | gpus\n"
-            "  projects list | projects add --root DIR [--id ID] [--name N] [--kind metamodel]\n"
+            "  projects list | projects add --root DIR [--id ID] [--name N] [--kind metamodel|pytorch]\n"
             "  projects rm <id>\n"
             "  schema <project> [--type train|build|eval|generate|test|docker|deploy|custom]\n"
             "  submit <project> <type> [-p k=v ...] [--params JSON|@file] [--title T] [--wait] [--follow]\n"
             "  train <project> [-p k=v ...] [--wait] [--follow]      (submit type=train)\n"
+            "       pytorch: -p script=train.py -p args=\"--steps 100\" -p gpus=0,1 -p launcher=ddp\n"
+            "       metamodel: -p steps=2000 -p dtype=1 -p grad=true\n"
             "  build <project> [--targets train,eval] [--clean] [--arch 120] [--wait]\n"
             "  jobs [--status S] [--project P] [--type T] [--limit N]\n"
             "  job <id> | stop <id>\n"

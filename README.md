@@ -3,7 +3,7 @@
 基于 **TensorN** C++ Backend 的 Train/Infer 平台可视化管理面板。单个 `tcd` 守护进程提供
 任务编排（CMake 构建 / 训练 / 评测 / 生成 / Docker / systemd 部署）、全量 REST API、
 SSE 实时事件流，以及 HTML5 面板；`tc` CLI 供 Agent 系统以报文/报表/流式方式交互；
-`tc_probe.hpp` 零依赖 SDK 供引擎内埋点。
+`tc_probe.hpp`（C++）/ `tc_probe.py`（PyTorch）零依赖 SDK 供引擎内埋点。
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 
@@ -39,6 +39,10 @@ SSE 实时事件流，以及 HTML5 面板；`tc` CLI 供 Agent 系统以报文/�
 - **多 GPU 并行** — `gpus=0,1,...` 每卡一个 rank 进程（`CUDA_VISIBLE_DEVICES` 隔离），
   `data_shard` 按 rank 自动偏移数据；逐 rank 采集 `grad_raw_r<i>.csv`，指标/梯度按
   (step, rank) 合并，面板可按 rank 过滤。
+- **PyTorch 接入** — 注册 `kind=pytorch` 项目后，用 `python` 或 `ddp`（每卡一个 worker）启动
+  训练脚本；tcd 注入 `TC_*` 环境与 `PYTHONPATH=sdk`，脚本两行接入 `sdk/tc_probe.py`
+  即可获得逐权重梯度、自定义指标、Chrome Trace 火焰图与面板「停止」语义，
+  数据走与 C++ 引擎相同的 metrics/grad/trace 通道并实时推送到面板。
 - **全参数任务配置** — schema 驱动表单覆盖 MetaModel 训练全部参数（运行/数据/结构/
   优化/损失/精度/冻结/日志/诊断/多 GPU 共 10 组），以及 build/docker/deploy/custom
   任务参数；schema 由 `GET /api/projects/:id/schema?type=<train|eval|...>` 提供。
@@ -69,7 +73,7 @@ SSE 实时事件流，以及 HTML5 面板；`tc` CLI 供 Agent 系统以报文/�
 ```
 src/        tcd 后端（api/jobs/store/events/monitor/adapter/profiler/process）
 cli/tc.cpp  tc CLI（Boost.Asio 同步 HTTP + SSE）
-sdk/        tc_probe.hpp（header-only，C++17，零依赖）
+sdk/        tc_probe.hpp（C++17）/ tc_probe.py（PyTorch）零依赖探针 SDK
 web/        前端 SPA（vanilla JS + uPlot + Canvas）
 tests/      smoke.py 端到端测试（stdlib only）
 docs/       DESIGN.md + img/ 功能展示截图
@@ -155,9 +159,10 @@ data/jobs/<id>/
 
 ```bash
 tc health | system | gpus
-tc projects list | projects add --root DIR [--id ID] [--name N] [--kind metamodel] | projects rm <id>
+tc projects list | projects add --root DIR [--id ID] [--name N] [--kind metamodel|pytorch] | projects rm <id>
 tc schema <project> --type train
 tc train <project> -p steps=2000 -p d_model=512 -p gpus=0,1 -p grad=true --wait
+tc train pyproj -p script=train.py -p args="--steps 1000" -p gpus=0,1 -p launcher=ddp --wait
 tc submit <project> eval -p ckpt=checkpoints/run.pt -p windows=32
 tc build <project> --targets train --arch 120 --wait
 tc jobs [--status running] | job <id> | stop <id>
@@ -202,7 +207,7 @@ tc events --count 10                  # 原始 SSE 事件流
 SSE 事件：`hello`、`gpu`、`heartbeat`（2s）、`job.status`、`job.log`、`metrics`、
 `grad.step`、`prof.ready`。
 
-## SDK 埋点（tc_probe.hpp）
+## SDK 埋点（tc_probe.hpp / tc_probe.py）
 
 三级探针，按侵入性递增：
 
@@ -224,6 +229,60 @@ probe.flush();                         // 或析构时自动 flush
 
 - **L2**：任意进程 `POST /api/jobs/:id/profile`（Chrome Trace）或写文件到 job 目录。
 
+PyTorch 版本位于 [sdk/tc_probe.py](sdk/tc_probe.py)（纯标准库，`torch` 可选）：
+
+```python
+from tc_probe import Probe
+
+probe = Probe()                     # TC_JOB_DIR 存在时启用，否则全部 no-op
+probe.watch(model)                  # 声明参数顺序（默认 reversed(named_parameters)）
+
+for step, batch in enumerate(loader):
+    loss = model(**batch).loss
+    loss.backward()
+    probe.step(step)                # 读取 p.grad L2 → 梯度示波器
+    probe.metrics(step, {"loss": loss, "lr": lr})
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    if probe.should_stop():         # 面板「停止」写 <out>.STOP
+        break
+
+with probe.scope("forward"):        # 耗时 span → trace.json 火焰图
+    out = model(x)
+```
+
+## PyTorch 接入
+
+1. 注册项目（root 为含训练脚本的仓库根）：`tc projects add --root D:/ML/mygpt --id mygpt --kind pytorch`
+2. 提交训练：
+
+```bash
+# 单卡
+tc train mygpt -p script=train.py -p args="--steps 2000 --batch 8" --wait
+# 多卡 DDP（每卡一个 worker，注入 torchrun 兼容的 RANK/WORLD_SIZE/LOCAL_RANK）
+tc train mygpt -p script=train.py -p launcher=ddp -p gpus=0,1 --wait
+# 环境变量与自定义 Python
+tc train mygpt -p python=.venv/Scripts/python.exe -p env="WANDB_MODE=offline;OMP_NUM_THREADS=4"
+```
+
+tcd 为训练进程注入：
+
+| 变量 | 说明 |
+|---|---|
+| `TC_JOB_ID` / `TC_JOB_DIR` / `TC_RANK` | 任务标识与探针落盘目录（SDK 依据 `LOCAL_RANK` 覆盖 rank） |
+| `TC_STOP_FILE` | 面板停止时写入的 STOP 文件，`probe.should_stop()` 轮询 |
+| `TC_SERVER` / `TC_TOKEN` | tcd 地址与鉴权（脚本内可自行走 REST） |
+| `PYTHONPATH` | 追加 `sdk/`，脚本直接 `from tc_probe import Probe`（`TCD_SDK_DIR` 可覆盖定位） |
+| `CUDA_VISIBLE_DEVICES` / `PYTHONUNBUFFERED` | GPU 可见性与实时日志 |
+
+- 未使用 SDK 时仍有实时日志、退出码与「停止」（15s 后强杀进程组）；使用 SDK 后
+  指标与梯度实时呈现在现有 tab 中，trace 在任务结束时生成火焰图，无需额外适配。
+- `kind=python` 与 `kind=pytorch` 等价。eval/generate/test 不单独编排，可用
+  `custom` 类型执行任意脚本，或在训练脚本内实现。
+- SDK 写入格式：`metrics.jsonl`（`src=probe`，tcd 直接转发 SSE）、
+  `grad_raw_r<rank>.csv`、`grad_order.json`（tcd 优先采用 SDK 声明顺序）、
+  `trace.json`（`ddp` 时其他 rank 写 `trace_r<rank>.json`，tcd 合并为一张火焰图）。
+
 ## MetaModel 集成约定
 
 - 训练二进制 `build/train.exe`，评测 `build/eval_ce.exe`，生成 `build/generate.exe`，
@@ -237,9 +296,11 @@ probe.flush();                         // 或析构时自动 flush
 ## 测试
 
 ```bash
-python tests/smoke.py            # 需 tcd 运行中 + MetaModel 已构建
-# 23 项检查：health/schema/train/metrics/grad 顺序与唯一性/profile/
+python tests/smoke.py             # 需 tcd 运行中 + MetaModel 已构建
+# 24 项检查：health/schema/train/metrics/grad 顺序与唯一性/profile/
 # chrome trace/报表/产物/stop 语义/双 rank 并行
+python tests/tc_probe_selftest.py # 探针 SDK 契约自测（stdlib；torch 可选）
+# 19 项检查：metrics/grad/order/trace/stop 文件格式、rank 检测、真实 torch 梯度
 ```
 
 ## 前端

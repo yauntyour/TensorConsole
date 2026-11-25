@@ -80,6 +80,48 @@ namespace tc
         return out;
     }
 
+    std::vector<std::string> split_quoted(const std::string &s)
+    {
+        std::vector<std::string> out;
+        std::string cur;
+        char quote = 0;
+        bool has = false;
+        auto flush = [&] {
+            if (has || !cur.empty())
+            {
+                out.push_back(cur);
+                cur.clear();
+                has = false;
+            }
+        };
+        for (char c : s)
+        {
+            if (quote)
+            {
+                if (c == quote)
+                    quote = 0;
+                else
+                    cur += c;
+                continue;
+            }
+            if (c == '"' || c == '\'')
+            {
+                quote = c;
+                has = true;
+                continue;
+            }
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                flush();
+                continue;
+            }
+            cur += c;
+            has = true;
+        }
+        flush();
+        return out;
+    }
+
     bool starts_with(const std::string &s, const std::string &p)
     {
         return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;

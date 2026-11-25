@@ -4,6 +4,7 @@
 #include "profiler.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 
@@ -57,6 +58,50 @@ namespace tc
                 out[trim(t.substr(0, eq))] = trim(t.substr(eq + 1));
         }
         return out;
+    }
+
+    // CLI `-p gpus=0` is typed as a JSON number; accept any scalar as a string.
+    static std::string jstr(const J &j, const char *key, const std::string &def = "")
+    {
+        auto it = j.find(key);
+        if (it == j.end() || it->is_null())
+            return def;
+        return it->is_string() ? it->get<std::string>() : it->dump();
+    }
+
+    // Locate sdk/tc_probe.py so Python train jobs can `from tc_probe import Probe`
+    // without touching the script (injected via PYTHONPATH).
+    static fs::path probe_sdk_dir(const Config &cfg)
+    {
+        if (const char *e = std::getenv("TCD_SDK_DIR"))
+        {
+            fs::path p = e;
+            if (fs::exists(p / "tc_probe.py"))
+                return p;
+        }
+        std::vector<fs::path> cands = {
+            fs::path(cfg.web_dir).parent_path() / "sdk",
+            fs::current_path() / "sdk",
+            fs::path(cfg.data_dir).parent_path() / "sdk",
+        };
+        for (auto &c : cands)
+        {
+            std::error_code ec;
+            if (fs::exists(c / "tc_probe.py", ec))
+                return c;
+        }
+        return {};
+    }
+
+    void JobManager::ensure_train_slot(const std::string &project_id, const J &params)
+    {
+        if (params.value("force", false))
+            return;
+        std::lock_guard<std::mutex> lk(mx_);
+        for (auto &kv : live_)
+            if (kv.second->rec.value("project_id", "") == project_id &&
+                kv.second->rec.value("type", "") == "train" && !kv.second->done)
+                throw std::runtime_error("another train job is running on this project (use force)");
     }
 
     // ------------------------------------------------------------- submit
@@ -118,7 +163,7 @@ namespace tc
             sp.argv = {"run"};
             if (params.value("detach", true))
                 sp.argv.push_back("-d");
-            std::string gpus = params.value("gpus", "all");
+            std::string gpus = jstr(params, "gpus", "all");
             if (!gpus.empty())
             {
                 sp.argv.push_back("--gpus");
@@ -271,6 +316,7 @@ namespace tc
         if (proj.is_null())
             throw std::runtime_error("unknown project: " + project_id);
         fs::path root = proj.at("root").get<std::string>();
+        const std::string kind = proj.value("kind", "generic");
         J params = body.value("params", J::object());
         std::string id = new_id("j");
         fs::path jd = store_.job_dir(id);
@@ -296,18 +342,117 @@ namespace tc
             on_line(Lp, rank, line);
         };
 
-        if (type == "train")
+        if (type == "train" && (kind == "pytorch" || kind == "python"))
         {
-            if (proj.value("kind", "generic") != "metamodel")
-                throw std::runtime_error("train type requires a metamodel-kind project (use custom otherwise)");
+            ensure_train_slot(project_id, params);
+            J pt = proj.value("train", J::object());
+            fs::path cwd = jstr(params, "cwd", root.string());
+            if (cwd.is_relative())
+                cwd = root / cwd;
+            std::string script = jstr(params, "script", pt.value("script", "train.py"));
+            fs::path spath = script;
+            if (spath.is_relative())
+                spath = cwd / spath;
+            if (script.empty() || !fs::exists(spath))
+                throw std::runtime_error("python script not found: " + spath.string() +
+                                         " — set params.script");
+            std::string python = jstr(params, "python", pt.value("python", "python"));
+            if (python.empty())
+                python = "python";
+            std::string out_base = jstr(params, "out", "checkpoints/tc_" + id);
+            std::vector<int> gpus;
+            for (auto &g : split(jstr(params, "gpus", "0"), ','))
+                if (!trim(g).empty())
+                    gpus.push_back(std::stoi(trim(g)));
+            if (gpus.empty())
+                gpus.push_back(0);
+            std::string gpu_list;
+            for (int g : gpus)
+                gpu_list += (gpu_list.empty() ? "" : ",") + std::to_string(g);
+            // ddp: tcd spawns one worker per GPU with torchrun-compatible env
+            // (RANK/WORLD_SIZE/LOCAL_RANK/MASTER_*), no torchrun process needed.
+            std::string launcher = jstr(params, "launcher", "python");
+            bool ddp = launcher == "ddp" || launcher == "torchrun";
+            int nranks = ddp ? (int)gpus.size() : 1;
+            std::vector<std::string> args = split_quoted(jstr(params, "args"));
+
+            std::map<std::string, std::string> env = kv_env(jstr(params, "env"));
+#ifdef _WIN32
+            // Windows wheels ship without libuv and TCPStore defaults to libuv;
+            // env:// init_process_group aborts unless USE_LIBUV=0.
+            if (!env.count("USE_LIBUV") && !std::getenv("USE_LIBUV"))
+                env["USE_LIBUV"] = "0";
+#endif
+            env["PYTHONUNBUFFERED"] = "1";
+            env["CUDA_VISIBLE_DEVICES"] = gpu_list;
+            env["MASTER_ADDR"] = "127.0.0.1";
+            env["MASTER_PORT"] = jstr(params, "master_port", "29500");
+            env["WORLD_SIZE"] = std::to_string(nranks);
+            // L1 probe SDK (sdk/tc_probe.py) reads these inside the training script.
+            env["TC_JOB_ID"] = id;
+            env["TC_JOB_DIR"] = fs::absolute(jd).string();
+            env["TC_SERVER"] = "http://" + cfg_.bind + ":" + std::to_string(cfg_.port);
+            if (!cfg_.token.empty())
+                env["TC_TOKEN"] = cfg_.token;
+            if (fs::path sdk = probe_sdk_dir(cfg_); !sdk.empty())
             {
-                std::lock_guard<std::mutex> lk(mx_);
-                for (auto &kv : live_)
-                    if (kv.second->rec.value("project_id", "") == project_id &&
-                        kv.second->rec.value("type", "") == "train" && !kv.second->done &&
-                        !params.value("force", false))
-                        throw std::runtime_error("another train job is running on this project (use force)");
+                std::string pp = fs::absolute(sdk).string();
+                env["TC_SDK_DIR"] = pp;
+#ifdef _WIN32
+                const char *sep = ";";
+#else
+                const char *sep = ":";
+#endif
+                if (const char *old = std::getenv("PYTHONPATH"); old && *old)
+                    pp += std::string(sep) + old;
+                env["PYTHONPATH"] = pp;
             }
+            J cmd = J::array();
+            cmd.push_back(python);
+            cmd.push_back(script);
+            for (auto &a : args)
+                cmd.push_back(a);
+            rec["cmd"] = cmd;
+
+            for (int i = 0; i < nranks; ++i)
+            {
+                ProcSpec sp;
+                sp.exe = python;
+                sp.cwd = cwd.string();
+                sp.argv.push_back(script);
+                for (auto &a : args)
+                    sp.argv.push_back(a);
+                sp.env = env;
+                sp.env["RANK"] = std::to_string(i);
+                sp.env["LOCAL_RANK"] = std::to_string(i);
+                sp.env["TC_RANK"] = std::to_string(i);
+                Rank rk;
+                rk.rank = i;
+                rk.gpu = gpus[i % (int)gpus.size()];
+                rk.out = nranks > 1 ? out_base + "_rank" + std::to_string(i) : out_base;
+                sp.env["TC_STOP_FILE"] = fs::absolute(root / (rk.out + ".STOP")).string();
+                rk.proc = std::make_unique<Process>();
+                int rank = i;
+                if (!rk.proc->start(sp, [emit, rank](const std::string &l) { emit(rank, l); }))
+                {
+                    for (auto &prev : L->ranks)
+                        prev.proc->terminate(false);
+                    throw std::runtime_error("failed to spawn train rank " + std::to_string(i) +
+                                             " (" + python + "; check params.python / PATH)");
+                }
+                rec["ranks"].push_back({{"rank", i}, {"gpu", rk.gpu},
+                                        {"pid", rk.proc->pid()}, {"out", rk.out}});
+                if (i == 0)
+                    rec["env"] = sp.env;
+                L->ranks.push_back(std::move(rk));
+            }
+            L->tails.resize(nranks); // one grad file per worker (probe LOCAL_RANK)
+        }
+        else if (type == "train")
+        {
+            if (kind != "metamodel")
+                throw std::runtime_error("train type requires a metamodel or pytorch project (use custom otherwise)");
+            ensure_train_slot(project_id, params);
             fs::path exe = root / "build" / exe_name("train");
             if (!fs::exists(exe))
                 throw std::runtime_error("train binary not found: " + exe.string() + " — run a build job first");
@@ -327,7 +472,7 @@ namespace tc
             }
             std::string out_base = params.value("out", "checkpoints/tc_" + id);
             std::vector<int> gpus;
-            for (auto &g : split(params.value("gpus", "0"), ','))
+            for (auto &g : split(jstr(params, "gpus", "0"), ','))
                 if (!trim(g).empty())
                     gpus.push_back(std::stoi(trim(g)));
             if (gpus.empty())
@@ -396,7 +541,7 @@ namespace tc
         }
         else if (type == "eval" || type == "generate" || type == "test")
         {
-            auto schema = adapter::schema_for(proj.value("kind", "generic"));
+            auto schema = adapter::schema_for(kind);
             std::string target = type;
             std::vector<std::string> positional;
             if (type == "test")
@@ -408,7 +553,7 @@ namespace tc
             }
             else if (type == "eval")
             {
-                if (proj.value("kind", "") == "metamodel")
+                if (kind == "metamodel")
                     target = "eval_ce";
                 std::string val = params.value("val", "");
                 if (val.empty() && fs::exists(root / "datasets/cache/mix_bil3b_mini_val.bin"))
@@ -421,6 +566,10 @@ namespace tc
             {
                 positional = {params.value("ckpt", "")};
             }
+            if (kind == "pytorch" || kind == "python")
+                throw std::runtime_error(
+                    type + " is not managed for pytorch projects; submit a custom job " +
+                    "(params.command=<python>, params.argv=\"<script> ...\") or add the action to your train script");
             fs::path exe = root / "build" / exe_name(target);
             if (!fs::exists(exe))
                 throw std::runtime_error("binary not found: " + exe.string());
@@ -588,42 +737,77 @@ namespace tc
             return;
         std::string id = L->rec.at("id").get<std::string>();
         fs::path root = L->rec.value("root", ".");
-        J cfg = J::object();
-        auto cfg_path = root / (L->ranks[0].out + "_config.json");
-        if (fs::exists(cfg_path))
+        // An SDK-declared order (tc_probe.py watch(model)) wins over templates.
+        J tmpl;
+        auto order_path = store_.job_dir(id) / "grad_order.json";
+        if (fs::exists(order_path))
         {
-            auto j = J::parse(read_file(cfg_path), nullptr, false);
-            if (j.is_object())
-                cfg = j;
+            auto j = J::parse(read_file(order_path), nullptr, false);
+            if (j.is_array() && !j.empty())
+                tmpl = j;
         }
-        if (!cfg.contains("n_decoder"))
+        if (tmpl.is_null())
         {
-            int max_layer = -1, max_expert = -1;
-            for (auto &nm : names)
+            J cfg = J::object();
+            auto cfg_path = root / (L->ranks[0].out + "_config.json");
+            if (fs::exists(cfg_path))
             {
+                auto j = J::parse(read_file(cfg_path), nullptr, false);
+                if (j.is_object())
+                    cfg = j;
+            }
+            bool metamodel = cfg.contains("n_decoder");
+            for (auto &nm : names)
                 if (starts_with(nm, "decoder_layers."))
+                    metamodel = true;
+            if (!metamodel)
+            {
+                // Arbitrary framework (PyTorch etc.): keep first-seen order.
+                J arr = J::array();
+                std::set<std::string> seen;
+                for (auto &nm : names)
                 {
-                    auto rest = nm.substr(15);
-                    auto dot = rest.find('.');
-                    if (dot != std::string::npos)
-                        max_layer = std::max(max_layer, std::atoi(rest.substr(0, dot).c_str()));
-                    auto ep = nm.find(".moe.experts.");
-                    if (ep != std::string::npos)
+                    if (!seen.insert(nm).second)
+                        continue;
+                    auto dot = nm.find('.');
+                    arr.push_back({{"name", nm},
+                                   {"module", nm.substr(0, dot)},
+                                   {"depth", (int)arr.size()}});
+                }
+                L->order = arr;
+                L->order_set = true;
+                write_file_atomic(order_path, L->order.dump(2));
+                return;
+            }
+            if (!cfg.contains("n_decoder"))
+            {
+                int max_layer = -1, max_expert = -1;
+                for (auto &nm : names)
+                {
+                    if (starts_with(nm, "decoder_layers."))
                     {
-                        auto rest2 = nm.substr(ep + 13);
-                        auto dot2 = rest2.find('.');
-                        if (dot2 != std::string::npos)
-                            max_expert = std::max(max_expert, std::atoi(rest2.substr(0, dot2).c_str()));
+                        auto rest = nm.substr(15);
+                        auto dot = rest.find('.');
+                        if (dot != std::string::npos)
+                            max_layer = std::max(max_layer, std::atoi(rest.substr(0, dot).c_str()));
+                        auto ep = nm.find(".moe.experts.");
+                        if (ep != std::string::npos)
+                        {
+                            auto rest2 = nm.substr(ep + 13);
+                            auto dot2 = rest2.find('.');
+                            if (dot2 != std::string::npos)
+                                max_expert = std::max(max_expert, std::atoi(rest2.substr(0, dot2).c_str()));
+                        }
                     }
                 }
+                cfg["n_decoder"] = max_layer + 1;
+                cfg["n_experts"] = max_expert + 1;
             }
-            cfg["n_decoder"] = max_layer + 1;
-            cfg["n_experts"] = max_expert + 1;
+            tmpl = adapter::grad_order_template(cfg);
         }
-        auto tmpl = adapter::grad_order_template(cfg);
         L->order = adapter::order_observed(tmpl, names);
         L->order_set = true;
-        write_file_atomic(store_.job_dir(id) / "grad_order.json", L->order.dump(2));
+        write_file_atomic(order_path, L->order.dump(2));
     }
 
     void JobManager::flush_grad(Live *L, size_t r, int64_t step)
@@ -684,6 +868,32 @@ namespace tc
 
     // ------------------------------------------------------------- watchers
 
+    // Rows written by probes (sdk/tc_probe.*) land in metrics.jsonl directly;
+    // relay them over SSE. Rows written by this watcher were already broadcast
+    // at ingestion time and are skipped.
+    void JobManager::tail_metrics(Live *L)
+    {
+        std::string id = L->rec.at("id").get<std::string>();
+        fs::path p = store_.job_dir(id) / "metrics.jsonl";
+        std::string data = read_tail(p, L->met_off, L->met_part);
+        for (auto &line : split(data, '\n'))
+        {
+            auto t = trim(line);
+            if (t.empty())
+                continue;
+            auto row = J::parse(t, nullptr, false);
+            if (!row.is_object())
+                continue;
+            auto src = row.value("src", "");
+            if (src == "stdout" || src == "csv" || src == "pool")
+                continue;
+            bus_.publish("metrics", J{{"job_id", id},
+                                      {"step", row.value("step", (int64_t)-1)},
+                                      {"rank", row.value("rank", (int64_t)0)},
+                                      {"v", row.value("v", J::object())}});
+        }
+    }
+
     void JobManager::watch_train(Live *L)
     {
         std::string id = L->rec.at("id").get<std::string>();
@@ -694,10 +904,12 @@ namespace tc
             for (size_t r = 0; r < L->ranks.size(); ++r)
             {
                 tail_csv(L, r);
-                tail_grad(L, r);
                 if (L->ranks[r].proc && L->ranks[r].proc->running())
                     all_exited = false;
             }
+            for (size_t r = 0; r < L->tails.size(); ++r)
+                tail_grad(L, r);
+            tail_metrics(L);
             if (L->stop_req && now_ms() > L->stop_deadline)
                 for (auto &rk : L->ranks)
                     if (rk.proc && rk.proc->running())
@@ -705,12 +917,14 @@ namespace tc
             if (all_exited)
             {
                 for (size_t r = 0; r < L->ranks.size(); ++r)
-                {
                     tail_csv(L, r);
+                for (size_t r = 0; r < L->tails.size(); ++r)
+                {
                     tail_grad(L, r);
                     flush_grad(L, r, L->tails[r].cur_step);
                     L->tails[r].cur_step = -1;
                 }
+                tail_metrics(L);
                 int code = 0;
                 for (auto &rk : L->ranks)
                     if (rk.proc)
@@ -780,14 +994,28 @@ namespace tc
         }
         if (profile.is_null())
         {
-            // L1 SDK span trace dropped by tc_probe.hpp
-            auto tp = store_.job_dir(id) / "trace.json";
+            // L1 SDK span traces: trace.json plus per-rank trace_r<i>.json (DDP).
+            J events = J::array();
+            auto merge = [&](const fs::path &p) {
+                auto j = J::parse(read_file(p), nullptr, false);
+                if (j.is_object() && j.contains("traceEvents") && j["traceEvents"].is_array())
+                    for (auto &e : j["traceEvents"])
+                        events.push_back(e);
+                else if (j.is_array())
+                    for (auto &e : j)
+                        events.push_back(e);
+            };
+            fs::path tp = store_.job_dir(id) / "trace.json";
             if (fs::exists(tp))
+                merge(tp);
+            for (auto &f : list_dir(store_.job_dir(id)))
             {
-                auto j = J::parse(read_file(tp), nullptr, false);
-                if (j.is_object() && j.contains("traceEvents"))
-                    profile = profiler::from_chrome_trace(j);
+                auto nm = f.filename().string();
+                if (starts_with(nm, "trace_r") && ends_with(nm, ".json"))
+                    merge(f);
             }
+            if (!events.empty())
+                profile = profiler::from_chrome_trace(J{{"traceEvents", events}});
         }
         if (!profile.is_null())
         {
